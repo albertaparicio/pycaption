@@ -83,7 +83,6 @@ class DFXPReader(BaseReader):
         self.read_invalid_positioning = (
             kw.get('read_invalid_positioning', False))
         self.nodes = []
-        self.framerate = self._get_framerate(DFXP_DEFAULT_FRAMERATE, DFXP_DEFAULT_FRAMERATEMULTIPLIER)
 
     def detect(self, content):
         if '</tt>' in content.lower():
@@ -104,17 +103,18 @@ class DFXPReader(BaseReader):
 
         default_language = dfxp_document.tt.attrs.get('xml:lang',
                                                       DEFAULT_LANGUAGE_CODE)
-        framerate = dfxp_document.tt.attrs.get('ttp:framerate',
-                                               DFXP_DEFAULT_FRAMERATE)
-        framerate_multiplier = dfxp_document.tt.attrs.get('ttp:frameratemultiplier',
-                                                          DFXP_DEFAULT_FRAMERATEMULTIPLIER)
-        self.framerate = self._get_framerate(framerate, framerate_multiplier)
+        framerate = float(dfxp_document.tt.attrs.get('ttp:framerate',
+                                                   DFXP_DEFAULT_FRAMERATE))
+        numerator, denominator = dfxp_document.tt.attrs.get('ttp:frameratemultiplier',
+                                                     DFXP_DEFAULT_FRAMERATEMULTIPLIER).split()
+        framerate_multiplier = int(numerator)/int(denominator)
+        framerate = framerate * framerate_multiplier
 
         # Each div represents all the captions for a single language.
         for div in dfxp_document.find_all('div'):
             lang = div.attrs.get('xml:lang', default_language)
 
-            caption_dict[lang] = self._convert_div_to_caption_list(div)
+            caption_dict[lang] = self._convert_div_to_caption_list(div, framerate)
 
         for style in dfxp_document.find_all('style'):
             id_ = style.attrs.get('xml:id') or style.attrs.get('id')
@@ -137,15 +137,15 @@ class DFXPReader(BaseReader):
         """Hook method for providing a custom DFXP parser"""
         return LayoutAwareDFXPParser
 
-    def _convert_div_to_caption_list(self, div):
+    def _convert_div_to_caption_list(self, div, framerate):
         return CaptionList(
-            [self._convert_p_tag_to_caption(p_tag)
+            [self._convert_p_tag_to_caption(p_tag, framerate)
              for p_tag in div.find_all('p') if p_tag.get_text().strip()],
             div.layout_info
         )
 
-    def _convert_p_tag_to_caption(self, p_tag):
-        start, end = self._find_and_convert_times(p_tag)
+    def _convert_p_tag_to_caption(self, p_tag, framerate):
+        start, end = self._find_and_convert_times(p_tag, framerate)
         self.nodes = []
         self._convert_tag_to_node(p_tag)
         styles = self._convert_style(p_tag)
@@ -156,7 +156,7 @@ class DFXPReader(BaseReader):
                 layout_info=p_tag.layout_info)
         return None
 
-    def _find_and_convert_times(self, p_tag):
+    def _find_and_convert_times(self, p_tag, framerate):
         begin = p_tag.get('begin')
         if not begin:
             raise CaptionReadTimingError(
@@ -168,34 +168,28 @@ class DFXPReader(BaseReader):
             raise CaptionReadTimingError(
                 f'Missing end time or duration on line {p_tag}.')
 
-        start = self._convert_timestamp_to_microseconds(begin)
+        start = self._convert_timestamp_to_microseconds(begin, framerate)
         if end:
-            end = self._convert_timestamp_to_microseconds(p_tag['end'])
+            end = self._convert_timestamp_to_microseconds(p_tag['end'], framerate)
         else:
-            dur = self._convert_timestamp_to_microseconds(p_tag['dur'])
+            dur = self._convert_timestamp_to_microseconds(p_tag['dur'], framerate)
             end = start + dur
 
         return start, end
 
-    @staticmethod
-    def _get_framerate(framerate, framerate_multiplier):
-        numerator, denominator = framerate_multiplier.split()
-        framerate_multiplier = int(numerator) / int(denominator)
-        framerate = float(framerate) * framerate_multiplier
-        return framerate
-
-    def _convert_timestamp_to_microseconds(self, stamp):
+    def _convert_timestamp_to_microseconds(self, stamp, framerate):
         match = TIME_EXPRESSION_PATTERN.search(stamp)
         if not match:
             raise CaptionReadTimingError(
                 f'Invalid timestamp: {stamp}. Accepted formats: hh:mm:ss / '
                 'hh:mm:ss:ff / hh:mm:ss.sub-frames / time_count h|m|s|ms|f.')
         if match.group('clock_time'):
-            return self._convert_clock_time_to_microseconds(match)
+            return self._convert_clock_time_to_microseconds(match, framerate)
         else:
-            return self._convert_time_count_to_microseconds(match)
+            return self._convert_time_count_to_microseconds(match, framerate)
 
-    def _convert_clock_time_to_microseconds(self, clock_time_match):
+    @staticmethod
+    def _convert_clock_time_to_microseconds(clock_time_match, framerate):
         microseconds = int(clock_time_match.group('hours')) * \
                        MICROSECONDS_PER_UNIT["hours"]
         microseconds += int(clock_time_match.group('minutes')) * \
@@ -206,11 +200,12 @@ class DFXPReader(BaseReader):
             microseconds += int(clock_time_match.group('sub_frames').ljust(
                 3, '0')) * MICROSECONDS_PER_UNIT["milliseconds"]
         elif clock_time_match.group('frames'):
-            microseconds += int(clock_time_match.group('frames')) / self.framerate * \
+            microseconds += int(clock_time_match.group('frames')) / framerate * \
                             MICROSECONDS_PER_UNIT["seconds"]
         return int(microseconds)
 
-    def _convert_time_count_to_microseconds(self, time_count_match):
+    @staticmethod
+    def _convert_time_count_to_microseconds(time_count_match, framerate):
         value = float(time_count_match.group('time_count'))
         metric = time_count_match.group("metric")
         if metric == "h":
@@ -222,7 +217,7 @@ class DFXPReader(BaseReader):
         elif metric == "ms":
             microseconds = value * MICROSECONDS_PER_UNIT["milliseconds"]
         elif metric == "f":
-            microseconds = value / self.framerate * MICROSECONDS_PER_UNIT["seconds"]
+            microseconds = value / framerate * MICROSECONDS_PER_UNIT["seconds"]
         elif metric == "t":
             raise NotImplementedError("The tick metric for time count is "
                                       "not currently implemented.")
